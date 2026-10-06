@@ -104,7 +104,9 @@ data class ScanState(
     val files: List<RecoverableFile> = emptyList(),
     val records: List<RecoverableRecord> = emptyList(),
     val error: String? = null,
-    val durationMs: Long = 0
+    val durationMs: Long = 0,
+    val speedBytesPerSec: Long = 0,   // 实时速率（滑动窗口平均）
+    val etaMs: Long = 0                // 估算剩余时间（毫秒）
 ) {
     /** 进度百分比 0.0 - 1.0 */
     val progress: Float

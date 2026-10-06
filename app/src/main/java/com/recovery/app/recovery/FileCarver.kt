@@ -41,7 +41,12 @@ class FileCarver {
      */
     sealed class ScanEvent {
         data class FileFound(val file: RecoverableFile) : ScanEvent()
-        data class Progress(val scannedBytes: Long, val totalBytes: Long) : ScanEvent()
+        data class Progress(
+            val scannedBytes: Long,
+            val totalBytes: Long,
+            val speedBytesPerSec: Long = 0,
+            val etaMs: Long = 0
+        ) : ScanEvent()
     }
 
     /**
@@ -166,6 +171,7 @@ class FileCarver {
         var scanned = 0L
         var idCounter = startId
         var lastProgressEmit = 0L
+        val rateTracker = RateTracker()
 
         while (scanned < scanSize) {
             val toRead = minOf(readBuffer.size, (scanSize - scanned).toInt())
@@ -195,11 +201,22 @@ class FileCarver {
             // 限流进度上报（每 1MB 或每 200ms）
             val now = System.currentTimeMillis()
             if (scanned - lastProgressEmit >= 1024 * 1024 || now - lastProgressEmit > 200) {
-                emit(ScanEvent.Progress(startOffset + scanned, startOffset + scanSize))
+                val absScanned = startOffset + scanned
+                val absTotal = startOffset + scanSize
+                rateTracker.addSample(now, absScanned)
+                emit(
+                    ScanEvent.Progress(
+                        scannedBytes = absScanned,
+                        totalBytes = absTotal,
+                        speedBytesPerSec = rateTracker.speedBytesPerSec(),
+                        etaMs = rateTracker.etaMs(absScanned, absTotal)
+                    )
+                )
                 lastProgressEmit = scanned
             }
         }
-        emit(ScanEvent.Progress(startOffset + scanSize, startOffset + scanSize))
+        val finalAbs = startOffset + scanSize
+        emit(ScanEvent.Progress(finalAbs, finalAbs, 0, 0))
     }
 
     /**
@@ -228,6 +245,7 @@ class FileCarver {
         var sampleIndex = 0L
         var idCounter = startId
         var lastProgressEmit = 0L
+        val rateTracker = RateTracker()
 
         while (true) {
             val expectedOffset = sampleIndex * step
@@ -254,15 +272,32 @@ class FileCarver {
             val scannedEstimate = sampleIndex * step
             val now = System.currentTimeMillis()
             if (now - lastProgressEmit > 300) {
-                emit(ScanEvent.Progress(scannedEstimate.coerceAtMost(partitionSize), partitionSize))
+                val absScanned = scannedEstimate.coerceAtMost(partitionSize)
+                rateTracker.addSample(now, absScanned)
+                emit(
+                    ScanEvent.Progress(
+                        scannedBytes = absScanned,
+                        totalBytes = partitionSize,
+                        speedBytesPerSec = rateTracker.speedBytesPerSec(),
+                        etaMs = rateTracker.etaMs(absScanned, partitionSize)
+                    )
+                )
                 lastProgressEmit = now
             }
         }
-        emit(ScanEvent.Progress(partitionSize, partitionSize))
+        emit(ScanEvent.Progress(partitionSize, partitionSize, 0, 0))
     }
 
     /**
      * 在缓冲区中查找文件签名并发射
+     *
+     * 智能跳过策略：
+     *  1. 先扫描所有签名（目标 + 非目标）
+     *  2. 对非目标类型中结构有效且体积 > skipThreshold 的文件，
+     *     记录其占用区间 [offset, offset+size] 为跳过区
+     *  3. 目标类型签名若落在跳过区内则跳过（极可能是大文件内部的字节，非独立文件）
+     *
+     * 收益：减少误报 + 节省目标匹配的 CPU 开销（尤其只扫图片时跳过视频区间）
      */
     private suspend fun processBuffer(
         buffer: ByteArray,
@@ -277,11 +312,34 @@ class FileCarver {
         emit: suspend (RecoverableFile) -> Unit
     ) {
         if (len < 16) return
-        val matches = SignatureRegistry.findMatches(buffer)
-        for ((sig, bufIndex) in matches) {
+        val allMatches = SignatureRegistry.findMatches(buffer)
+        if (allMatches.isEmpty()) return
+
+        // 阈值：非目标文件超过此大小才建立跳过区间（过小文件跳过无意义）
+        val skipThreshold = 256L * 1024 // 256KB
+
+        // 第一阶段：收集非目标大文件的占用区间
+        val skipRegions = ArrayList<Pair<Long, Long>>()
+        for ((sig, bufIndex) in allMatches) {
+            if (sig.type in types) continue
+            if (!validateStructure(sig, buffer, bufIndex, len)) continue
+            val est = estimateFileSize(sig, buffer, bufIndex, len)
+            if (est < skipThreshold || est > sig.maxSize) continue
+            val start = bufferBaseOffset + bufIndex
+            skipRegions.add(start to (start + est))
+        }
+
+        // 判断偏移是否落在任一跳过区间内
+        val inSkipRegion: (Long) -> Boolean = { offset ->
+            skipRegions.any { (s, e) -> offset in s until e }
+        }
+
+        // 第二阶段：处理目标类型签名，跳过落在非目标大文件区间内的匹配
+        for ((sig, bufIndex) in allMatches) {
             if (sig.type !in types) continue
             val absoluteOffset = bufferBaseOffset + bufIndex
             if (settings.dedupeEnabled && !seenOffsets.add(absoluteOffset)) continue
+            if (inSkipRegion(absoluteOffset)) continue
             if (!validateStructure(sig, buffer, bufIndex, len)) continue
 
             val estimatedSize = estimateFileSize(sig, buffer, bufIndex, len)
@@ -322,6 +380,41 @@ class FileCarver {
         bytes < 1024 * 1024 -> "${bytes / 1024} KB"
         bytes < 1024L * 1024 * 1024 -> "${"%.1f".format(bytes / (1024.0 * 1024))} MB"
         else -> "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))} GB"
+    }
+
+    /**
+     * 滑动窗口速率计算器
+     * 保留最近 windowMs 毫秒内的 (时间戳, 已扫描字节) 样本，
+     * 计算平均速率并估算剩余时间。
+     */
+    private class RateTracker(private val windowMs: Long = 5000) {
+        private val samples = ArrayDeque<Pair<Long, Long>>() // (timestamp, scannedBytes)
+
+        fun addSample(timestamp: Long, scannedBytes: Long) {
+            samples.addLast(timestamp to scannedBytes)
+            val cutoff = timestamp - windowMs
+            while (samples.isNotEmpty() && samples.first().first < cutoff) {
+                samples.removeFirst()
+            }
+        }
+
+        /** 平均速率（字节/秒），0 表示样本不足 */
+        fun speedBytesPerSec(): Long {
+            if (samples.size < 2) return 0
+            val (t0, b0) = samples.first()
+            val (t1, b1) = samples.last()
+            val dt = t1 - t0
+            if (dt <= 0) return 0
+            return (b1 - b0) * 1000L / dt
+        }
+
+        /** 估算剩余时间（毫秒），0 表示无法估算 */
+        fun etaMs(scannedBytes: Long, totalBytes: Long): Long {
+            val speed = speedBytesPerSec()
+            if (speed <= 0) return 0
+            val remaining = (totalBytes - scannedBytes).coerceAtLeast(0)
+            return remaining * 1000L / speed
+        }
     }
 
     /**

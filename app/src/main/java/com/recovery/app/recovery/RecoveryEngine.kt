@@ -115,6 +115,8 @@ class RecoveryEngine {
                                 _scanState.value = _scanState.value.copy(
                                     scannedBytes = event.scannedBytes,
                                     totalBytes = event.totalBytes,
+                                    speedBytesPerSec = event.speedBytesPerSec,
+                                    etaMs = event.etaMs,
                                     currentPhaseText = "已扫描 ${formatBytes(event.scannedBytes)} / ${formatBytes(event.totalBytes)} · 发现 ${files.size} 个文件"
                                 )
                             }

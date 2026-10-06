@@ -110,6 +110,22 @@ fun RecoveryApp(onVerifyCredential: ((Boolean) -> Unit) -> Unit = {}) {
 
 // ==================== 数据还原界面 ====================
 
+// ==================== 格式化辅助 ====================
+
+private fun formatSpeed(bytesPerSec: Long): String = when {
+    bytesPerSec <= 0 -> "--"
+    bytesPerSec < 1024 * 1024 -> "${"%.1f".format(bytesPerSec / 1024.0)} KB/s"
+    else -> "${"%.2f".format(bytesPerSec / (1024.0 * 1024))} MB/s"
+}
+
+private fun formatEta(ms: Long): String = when {
+    ms <= 0 -> "计算中..."
+    ms < 1000 -> "<1秒"
+    ms < 60_000 -> "${ms / 1000}秒"
+    ms < 3600_000 -> "${ms / 60_000}分${(ms % 60_000) / 1000}秒"
+    else -> "${ms / 3600_000}时${(ms % 3600_000) / 60_000}分"
+}
+
 @Composable
 fun RecoveryScreen(viewModel: MainViewModel) {
     val rootState by viewModel.rootAvailable.collectAsState()
@@ -280,6 +296,24 @@ fun RecoveryScreen(viewModel: MainViewModel) {
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // 实时速率 + 倒计时
+            if (scanState.isScanning && scanState.totalBytes > 0) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "速率: ${formatSpeed(scanState.speedBytesPerSec)}",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        "剩余: ${formatEta(scanState.etaMs)}",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
             // 实时统计
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("文件: ${scanState.filesFound}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
