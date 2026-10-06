@@ -3,6 +3,7 @@ package com.recovery.app
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.recovery.app.model.Confidence
+import com.recovery.app.model.LogEntry
 import com.recovery.app.model.RecoverableFile
 import com.recovery.app.model.RecoverableRecord
 import com.recovery.app.model.RecoveryType
@@ -37,6 +38,7 @@ class MainViewModel : ViewModel() {
 
     // ===== 恢复状态（实时流） =====
     val scanState: StateFlow<ScanState> = recoveryEngine.scanState
+    val logs: StateFlow<List<LogEntry>> = recoveryEngine.logs
 
     private val _rootAvailable = MutableStateFlow<Boolean?>(null)
     val rootAvailable: StateFlow<Boolean?> = _rootAvailable.asStateFlow()

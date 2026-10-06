@@ -6,6 +6,8 @@ import com.recovery.app.model.RecoveryType
 import com.recovery.app.model.ScanSettings
 import com.recovery.app.model.ScanState
 import com.recovery.app.model.ScanPhase
+import com.recovery.app.model.LogEntry
+import com.recovery.app.model.LogLevel
 import com.recovery.app.util.RootShell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +23,7 @@ import java.io.File
  *  - 实时流式更新 ScanState（进度条 + 中间结果）
  *  - 支持扫描设置（快速/完整模式、大小过滤、置信度过滤）
  *  - 文件类与数据库类结果合并到同一个状态流
+ *  - 实时日志流（环形缓冲，最多 300 条）
  */
 class RecoveryEngine {
 
@@ -37,6 +40,27 @@ class RecoveryEngine {
     private val _scanState = MutableStateFlow(ScanState())
     val scanState: StateFlow<ScanState> = _scanState.asStateFlow()
 
+    // 日志环形缓冲（最多 300 条）
+    private val maxLogs = 300
+    private val _logs = MutableStateFlow<List<LogEntry>>(emptyList())
+    val logs: StateFlow<List<LogEntry>> = _logs.asStateFlow()
+
+    private fun log(level: LogLevel, message: String) {
+        val entry = LogEntry(System.currentTimeMillis(), level, message)
+        val current = _logs.value
+        val updated = if (current.size >= maxLogs) {
+            current.drop(current.size - maxLogs + 1) + entry
+        } else {
+            current + entry
+        }
+        _logs.value = updated
+    }
+
+    private fun logInfo(msg: String) = log(LogLevel.INFO, msg)
+    private fun logWarn(msg: String) = log(LogLevel.WARN, msg)
+    private fun logError(msg: String) = log(LogLevel.ERROR, msg)
+    private fun logSuccess(msg: String) = log(LogLevel.SUCCESS, msg)
+
     /**
      * 执行完整恢复扫描，结果通过 scanState 实时更新
      */
@@ -46,6 +70,7 @@ class RecoveryEngine {
             val files = mutableListOf<RecoverableFile>()
             val records = mutableListOf<RecoverableRecord>()
 
+            logInfo("开始恢复扫描，类型: ${types.joinToString { it.name }}")
             _scanState.value = ScanState(
                 phase = ScanPhase.LOCATING_PARTITION,
                 isScanning = true,
@@ -63,6 +88,7 @@ class RecoveryEngine {
             if (fileTypes.isNotEmpty()) {
                 val partition = RootShell.getUserdataPartition()
                 if (partition != null) {
+                    logInfo("定位到分区: $partition")
                     _scanState.value = _scanState.value.copy(
                         phase = ScanPhase.SCANNING_FILES,
                         currentPhaseText = "正在扫描分区: $partition"
@@ -70,11 +96,12 @@ class RecoveryEngine {
 
                     var lastEmitTime = System.currentTimeMillis()
 
-                    fileCarver.scanPartition(partition, fileTypes, settings).collect { event ->
+                    fileCarver.scanPartition(partition, fileTypes, settings) { logMsg ->
+                        logInfo(logMsg)
+                    }.collect { event ->
                         when (event) {
                             is FileCarver.ScanEvent.FileFound -> {
                                 files.add(event.file)
-                                // 限流：每 100ms 或每 10 个文件更新一次
                                 val now = System.currentTimeMillis()
                                 if (now - lastEmitTime > 100 || files.size % 10 == 0) {
                                     _scanState.value = _scanState.value.copy(
@@ -93,7 +120,9 @@ class RecoveryEngine {
                             }
                         }
                     }
+                    logSuccess("文件扫描完成，共发现 ${files.size} 个文件")
                 } else {
+                    logError("无法定位 userdata 分区")
                     _scanState.value = _scanState.value.copy(
                         currentPhaseText = "无法定位 userdata 分区"
                     )
@@ -105,6 +134,7 @@ class RecoveryEngine {
 
             for (type in dbTypes) {
                 val dbPath = systemDbPaths[type] ?: continue
+                logInfo("正在恢复 ${typeText(type)} 数据库: $dbPath")
                 _scanState.value = _scanState.value.copy(
                     phase = ScanPhase.SCANNING_DB,
                     currentPhaseText = "正在恢复 ${typeText(type)} 数据库..."
@@ -116,6 +146,7 @@ class RecoveryEngine {
                 if (copied && File(tempDb).exists()) {
                     val recovered = sqliteRecovery.recoverDeletedRecords(tempDb, type)
                     records.addAll(recovered)
+                    logSuccess("恢复 ${recovered.size} 条 ${typeText(type)} 记录")
                     _scanState.value = _scanState.value.copy(
                         records = records.toList(),
                         recordsFound = records.size,
@@ -123,6 +154,7 @@ class RecoveryEngine {
                     )
                     RootShell.execute("rm -f $tempDb")
                 } else {
+                    logWarn("无法读取 ${typeText(type)} 数据库（需要 root 或路径不存在）")
                     _scanState.value = _scanState.value.copy(
                         currentPhaseText = "无法读取 ${typeText(type)} 数据库（需要 root）"
                     )
@@ -130,6 +162,7 @@ class RecoveryEngine {
             }
 
             // 完成
+            val duration = System.currentTimeMillis() - startTime
             _scanState.value = _scanState.value.copy(
                 phase = ScanPhase.COMPLETED,
                 isScanning = false,
@@ -138,9 +171,10 @@ class RecoveryEngine {
                 filesFound = files.size,
                 recordsFound = records.size,
                 scannedBytes = _scanState.value.totalBytes,
-                durationMs = System.currentTimeMillis() - startTime,
-                currentPhaseText = "扫描完成：发现 ${files.size} 个文件，${records.size} 条记录"
+                durationMs = duration,
+                currentPhaseText = "扫描完成：发现 ${files.size} 个文件，${records.size} 条记录（耗时 ${duration / 1000}s）"
             )
+            logSuccess("全部扫描完成，耗时 ${duration / 1000}s")
         }
     }
 

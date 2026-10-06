@@ -121,18 +121,35 @@ data class ScanState(
  * 扫描模式
  */
 enum class ScanMode {
-    QUICK,   // 快速：仅扫描前 N GB，适合快速定位
-    FULL     // 完整：扫描整个分区
+    QUICK,   // 稀疏采样：每读 sampleBytes 跳过 gapBytes，快速覆盖全分区
+    DEEP,    // 完整深度扫描：顺序读取整个范围
+    RANGE    // 范围扫描：扫描指定百分比区间 [rangeStart%, rangeEnd%]
 }
 
 /**
  * 扫描设置
  */
 data class ScanSettings(
-    val mode: ScanMode = ScanMode.FULL,
-    val quickScanLimitGb: Int = 5,        // 快速扫描上限（GB）
-    val minFileSizeKb: Int = 1,           // 最小文件大小（KB）
-    val maxFileSizeMb: Int = 2048,        // 最大文件大小（MB）
-    val onlyHighConfidence: Boolean = false, // 仅显示高/中置信度
-    val dedupeEnabled: Boolean = true     // 启用去重
+    val mode: ScanMode = ScanMode.DEEP,
+    // RANGE 模式：扫描的百分比区间
+    val rangeStartPercent: Float = 0f,
+    val rangeEndPercent: Float = 100f,
+    // QUICK 模式：采样参数
+    val sampleBytes: Long = 4L * 1024 * 1024,   // 每次采样读取的字节数
+    val gapBytes: Long = 12L * 1024 * 1024,     // 每次采样后跳过的字节数
+    // 公共
+    val minFileSizeKb: Int = 1,                 // 最小文件大小（KB）
+    val maxFileSizeMb: Int = 2048,              // 最大文件大小（MB）
+    val onlyHighConfidence: Boolean = false,    // 仅显示中/高置信度
+    val dedupeEnabled: Boolean = true           // 启用去重
+)
+
+// ========== 实时日志 ==========
+
+enum class LogLevel { INFO, WARN, ERROR, SUCCESS }
+
+data class LogEntry(
+    val timestamp: Long,
+    val level: LogLevel,
+    val message: String
 )

@@ -132,6 +132,69 @@ object RootShell {
     }
 
     /**
+     * 打开一个持续输出原始字节的进程流（用于顺序深度/范围扫描）
+     *
+     * 单个 su 进程执行 dd，从 startOffset 开始输出 size 字节，
+     * 调用方持续读取其 inputStream，避免逐次 su 进程开销。
+     *
+     * @return Process（需调用方负责读取并销毁）
+     */
+    fun openBlockStream(device: String, startOffset: Long, size: Long): Process? {
+        return try {
+            val bs = 4096L
+            val skipBlocks = startOffset / bs
+            val countBlocks = (size + bs - 1) / bs
+            Runtime.getRuntime().exec(
+                arrayOf(
+                    "su", "-c",
+                    "dd if=$device bs=$bs skip=$skipBlocks count=$countBlocks 2>/dev/null"
+                )
+            )
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 构建稀疏采样扫描的 shell 命令（用于 QUICK 模式）
+     *
+     * 在单个 su 进程内通过 shell while 循环，每隔 (sample+gap) 字节读取 sample 字节，
+     * 真正减少 I/O（而非读后丢弃）。所有采样数据连续输出到 stdout。
+     */
+    fun buildSparseScanCommand(
+        device: String,
+        totalSize: Long,
+        sampleBytes: Long,
+        gapBytes: Long
+    ): String {
+        val bs = 4096
+        val step = sampleBytes + gapBytes
+        // bash while 循环：pos 从 0 到 totalSize，每次读 sample 字节
+        return "pos=0; step=$step; sample=$sampleBytes; bs=$bs; " +
+                "total=$totalSize; " +
+                "while [ \$pos -lt \$total ]; do " +
+                "dd if=$device bs=\$bs skip=\$((pos/bs)) count=\$(((sample+bs-1)/bs)) 2>/dev/null; " +
+                "pos=\$((pos+step)); done"
+    }
+
+    /**
+     * 执行稀疏采样命令并返回进程
+     */
+    fun openSparseScanStream(
+        device: String,
+        totalSize: Long,
+        sampleBytes: Long,
+        gapBytes: Long
+    ): Process? {
+        return try {
+            val cmd = buildSparseScanCommand(device, totalSize, sampleBytes, gapBytes)
+            Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
      * 将受保护的数据库复制到临时可读路径
      */
     suspend fun copyProtectedFile(remotePath: String, tempPath: String): Boolean {

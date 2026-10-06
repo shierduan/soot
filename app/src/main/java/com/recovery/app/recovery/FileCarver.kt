@@ -45,122 +45,283 @@ class FileCarver {
 
     /**
      * 扫描指定分区
+     *
+     * 性能策略：
+     *  - DEEP/RANGE：单个 su 进程流式 dd，持续读取 16MB 缓冲区，消除逐次 su 开销
+     *  - QUICK：单 su 进程内 shell 循环稀疏采样，真正减少 I/O
+     *
+     * @param onLog 日志回调
      */
     fun scanPartition(
         device: String,
         types: Set<RecoveryType>,
-        settings: ScanSettings = ScanSettings()
+        settings: ScanSettings = ScanSettings(),
+        onLog: (String) -> Unit = {}
     ): Flow<ScanEvent> = flow {
         val targetSignatures = SignatureRegistry.signatures.filter { it.type in types }
         if (targetSignatures.isEmpty()) return@flow
 
         // 获取分区大小
         val partitionSize = getPartitionSize(device)
-        if (partitionSize <= 0) return@flow
-
-        // 快速扫描限制
-        val scanLimit = if (settings.mode == com.recovery.app.model.ScanMode.QUICK) {
-            (settings.quickScanLimitGb.toLong() * 1024 * 1024 * 1024).coerceAtMost(partitionSize)
-        } else {
-            partitionSize
+        if (partitionSize <= 0) {
+            onLog("无法获取分区 $device 大小")
+            return@flow
         }
+
+        // 计算扫描范围 [startOffset, scanSize)
+        val (startOffset, scanSize, modeDesc) = computeScanRange(partitionSize, settings)
+        onLog("分区大小: ${formatBytes(partitionSize)}, 模式: $modeDesc, " +
+                "范围: ${formatBytes(startOffset)} ~ ${formatBytes(startOffset + scanSize)}")
 
         val minBytes = settings.minFileSizeKb * 1024L
         val maxBytes = settings.maxFileSizeMb * 1024L * 1024L
-
-        // 去重集合（偏移量）
         val seenOffsets = HashSet<Long>()
         var idCounter = 0L
+
+        when (settings.mode) {
+            ScanMode.DEEP, ScanMode.RANGE -> {
+                // 顺序流式扫描
+                val process = RootShell.openBlockStream(device, startOffset, scanSize)
+                if (process == null) {
+                    onLog("无法打开块设备流")
+                    return@flow
+                }
+                onLog("已打开块设备流，开始顺序扫描...")
+                try {
+                    streamSequentialScan(
+                        process, device, startOffset, scanSize, types, settings,
+                        minBytes, maxBytes, seenOffsets, idCounter,
+                        onLog
+                    ) { evt -> emit(evt); if (evt is ScanEvent.FileFound) idCounter++ }
+                } finally {
+                    runCatching { process.destroy() }
+                }
+            }
+            ScanMode.QUICK -> {
+                // 稀疏采样扫描
+                val process = RootShell.openSparseScanStream(
+                    device, partitionSize, settings.sampleBytes, settings.gapBytes
+                )
+                if (process == null) {
+                    onLog("无法打开稀疏扫描流")
+                    return@flow
+                }
+                onLog("已打开稀疏扫描流（采样 ${formatBytes(settings.sampleBytes)} / 跳过 ${formatBytes(settings.gapBytes)}）")
+                try {
+                    streamSparseScan(
+                        process, device, partitionSize, settings.sampleBytes, settings.gapBytes,
+                        types, settings, minBytes, maxBytes, seenOffsets, idCounter,
+                        onLog
+                    ) { evt -> emit(evt); if (evt is ScanEvent.FileFound) idCounter++ }
+                } finally {
+                    runCatching { process.destroy() }
+                }
+            }
+        }
+        onLog("扫描完成")
+    }.flowOn(Dispatchers.IO)
+
+    /**
+     * 计算扫描范围
+     * @return Triple(startOffset, scanSize, 描述)
+     */
+    private fun computeScanRange(partitionSize: Long, settings: ScanSettings): Triple<Long, Long, String> {
+        val bs = 4096L
+        return when (settings.mode) {
+            ScanMode.DEEP -> Triple(0L, partitionSize, "深度扫描")
+            ScanMode.RANGE -> {
+                val start = (partitionSize * settings.rangeStartPercent / 100).toLong()
+                val end = (partitionSize * settings.rangeEndPercent / 100).toLong()
+                val alignedStart = (start / bs) * bs
+                val size = (end - alignedStart).coerceAtLeast(0)
+                Triple(alignedStart, size,
+                    "范围扫描 ${settings.rangeStartPercent.toInt()}%~${settings.rangeEndPercent.toInt()}%")
+            }
+            ScanMode.QUICK -> Triple(0L, partitionSize, "快速扫描(稀疏采样)")
+        }
+    }
+
+    /**
+     * 顺序流式扫描（DEEP / RANGE）
+     */
+    private suspend fun streamSequentialScan(
+        process: Process,
+        device: String,
+        startOffset: Long,
+        scanSize: Long,
+        types: Set<RecoveryType>,
+        settings: ScanSettings,
+        minBytes: Long,
+        maxBytes: Long,
+        seenOffsets: HashSet<Long>,
+        startId: Long,
+        onLog: (String) -> Unit,
+        emit: suspend (ScanEvent) -> Unit
+    ) {
+        val input = process.inputStream
+        val readBuffer = ByteArray(bufferSize)
         val overlap = ByteArray(overlapSize)
         var overlapLen = 0
-        var offset = 0L
+        var scanned = 0L
+        var idCounter = startId
+        var lastProgressEmit = 0L
 
-        while (offset < scanLimit) {
-            val toRead = minOf(bufferSize.toLong(), scanLimit - offset).toInt()
-            val buffer = ByteArray(toRead + overlapLen)
+        while (scanned < scanSize) {
+            val toRead = minOf(readBuffer.size, (scanSize - scanned).toInt())
+            val n = input.read(readBuffer, 0, toRead)
+            if (n <= 0) break
 
-            // 复制上一次的重叠部分
-            if (overlapLen > 0) {
-                overlap.copyInto(buffer, 0, 0, overlapLen)
+            // 合并 overlap + 新数据
+            val combined = ByteArray(overlapLen + n)
+            if (overlapLen > 0) overlap.copyInto(combined, 0, 0, overlapLen)
+            readBuffer.copyInto(combined, overlapLen, 0, n)
+            val actualLen = combined.size
+
+            val bufferBaseOffset = startOffset + scanned - overlapLen
+            processBuffer(
+                combined, actualLen, bufferBaseOffset, device, types, settings,
+                minBytes, maxBytes, seenOffsets
+            ) { file ->
+                emit(ScanEvent.FileFound(file.copy(id = ++idCounter)))
             }
 
-            // 读取新数据（快速大块读取）
-            val newBytes = RootShell.readBytes(device, offset, toRead)
-            newBytes.copyInto(buffer, overlapLen)
-
-            val actualLen = overlapLen + newBytes.size
-            if (actualLen < 16) break
-
-            val bufferBaseOffset = offset - overlapLen
-
-            // 搜索文件签名
-            val matches = SignatureRegistry.findMatches(buffer)
-
-            for ((sig, bufIndex) in matches) {
-                if (sig.type !in types) continue
-
-                val absoluteOffset = bufferBaseOffset + bufIndex
-
-                // 去重：同一偏移只处理一次
-                if (settings.dedupeEnabled) {
-                    if (!seenOffsets.add(absoluteOffset)) continue
-                }
-
-                // 结构校验（过滤明显误报）
-                if (!validateStructure(sig, buffer, bufIndex, actualLen)) continue
-
-                // 估算文件大小
-                val estimatedSize = estimateFileSize(sig, buffer, bufIndex, actualLen)
-
-                // 大小过滤
-                if (estimatedSize < minBytes || estimatedSize > maxBytes) continue
-                if (estimatedSize > sig.maxSize) continue
-
-                // 计算置信度
-                val confidence = computeConfidence(sig, buffer, bufIndex, actualLen)
-
-                // 仅显示高/中置信度
-                if (settings.onlyHighConfidence && confidence == Confidence.LOW) continue
-
-                // 读取文件头（用于预览）
-                val headerLen = minOf(512, estimatedSize.toInt())
-                val headerBytes = if (bufIndex + headerLen <= actualLen) {
-                    buffer.copyOfRange(bufIndex, minOf(bufIndex + headerLen, actualLen))
-                } else ByteArray(0)
-
-                // 图片：尝试解码缩略图
-                val thumbnail = if (sig.type == RecoveryType.IMAGE) {
-                    decodeThumbnail(buffer, bufIndex, actualLen)
-                } else null
-
-                emit(
-                    ScanEvent.FileFound(
-                        RecoverableFile(
-                            id = ++idCounter,
-                            type = sig.type,
-                            mimeType = sig.mimeType,
-                            extension = sig.extension,
-                            offset = absoluteOffset,
-                            estimatedSize = estimatedSize,
-                            headerBytes = headerBytes,
-                            source = device,
-                            confidence = confidence,
-                            thumbnail = thumbnail
-                        )
-                    )
-                )
-            }
-
-            // 保存尾部重叠
+            // 保存尾部 overlap
             overlapLen = minOf(overlapSize, actualLen)
-            buffer.copyInto(overlap, 0, actualLen - overlapLen, actualLen)
+            combined.copyInto(overlap, 0, actualLen - overlapLen, actualLen)
 
-            offset += toRead
+            scanned += n
 
-            // 上报进度
-            emit(ScanEvent.Progress(offset.coerceAtMost(scanLimit), scanLimit))
+            // 限流进度上报（每 1MB 或每 200ms）
+            val now = System.currentTimeMillis()
+            if (scanned - lastProgressEmit >= 1024 * 1024 || now - lastProgressEmit > 200) {
+                emit(ScanEvent.Progress(startOffset + scanned, startOffset + scanSize))
+                lastProgressEmit = scanned
+            }
         }
-    }.flowOn(Dispatchers.IO)
+        emit(ScanEvent.Progress(startOffset + scanSize, startOffset + scanSize))
+    }
+
+    /**
+     * 稀疏采样扫描（QUICK）
+     * 每次读取 sampleBytes（对齐到 4096），对应分区偏移 = sampleIndex * (sample+gap)
+     */
+    private suspend fun streamSparseScan(
+        process: Process,
+        device: String,
+        partitionSize: Long,
+        sampleBytes: Long,
+        gapBytes: Long,
+        types: Set<RecoveryType>,
+        settings: ScanSettings,
+        minBytes: Long,
+        maxBytes: Long,
+        seenOffsets: HashSet<Long>,
+        startId: Long,
+        onLog: (String) -> Unit,
+        emit: suspend (ScanEvent) -> Unit
+    ) {
+        val input = process.inputStream
+        val step = sampleBytes + gapBytes
+        val sampleAligned = ((sampleBytes + 4095) / 4096) * 4096
+        val sampleBuf = ByteArray(sampleAligned.toInt())
+        var sampleIndex = 0L
+        var idCounter = startId
+        var lastProgressEmit = 0L
+
+        while (true) {
+            val expectedOffset = sampleIndex * step
+            if (expectedOffset >= partitionSize) break
+
+            // 读取一个采样块
+            var totalRead = 0
+            while (totalRead < sampleBuf.size) {
+                val n = input.read(sampleBuf, totalRead, sampleBuf.size - totalRead)
+                if (n <= 0) break
+                totalRead += n
+            }
+            if (totalRead <= 0) break
+
+            val actualLen = totalRead
+            processBuffer(
+                sampleBuf, actualLen, expectedOffset, device, types, settings,
+                minBytes, maxBytes, seenOffsets
+            ) { file ->
+                emit(ScanEvent.FileFound(file.copy(id = ++idCounter)))
+            }
+
+            sampleIndex++
+            val scannedEstimate = sampleIndex * step
+            val now = System.currentTimeMillis()
+            if (now - lastProgressEmit > 300) {
+                emit(ScanEvent.Progress(scannedEstimate.coerceAtMost(partitionSize), partitionSize))
+                lastProgressEmit = now
+            }
+        }
+        emit(ScanEvent.Progress(partitionSize, partitionSize))
+    }
+
+    /**
+     * 在缓冲区中查找文件签名并发射
+     */
+    private suspend fun processBuffer(
+        buffer: ByteArray,
+        len: Int,
+        bufferBaseOffset: Long,
+        device: String,
+        types: Set<RecoveryType>,
+        settings: ScanSettings,
+        minBytes: Long,
+        maxBytes: Long,
+        seenOffsets: HashSet<Long>,
+        emit: suspend (RecoverableFile) -> Unit
+    ) {
+        if (len < 16) return
+        val matches = SignatureRegistry.findMatches(buffer)
+        for ((sig, bufIndex) in matches) {
+            if (sig.type !in types) continue
+            val absoluteOffset = bufferBaseOffset + bufIndex
+            if (settings.dedupeEnabled && !seenOffsets.add(absoluteOffset)) continue
+            if (!validateStructure(sig, buffer, bufIndex, len)) continue
+
+            val estimatedSize = estimateFileSize(sig, buffer, bufIndex, len)
+            if (estimatedSize < minBytes || estimatedSize > maxBytes) continue
+            if (estimatedSize > sig.maxSize) continue
+
+            val confidence = computeConfidence(sig, buffer, bufIndex, len)
+            if (settings.onlyHighConfidence && confidence == Confidence.LOW) continue
+
+            val headerLen = minOf(512, estimatedSize.toInt())
+            val headerBytes = if (bufIndex + headerLen <= len) {
+                buffer.copyOfRange(bufIndex, minOf(bufIndex + headerLen, len))
+            } else ByteArray(0)
+
+            val thumbnail = if (sig.type == RecoveryType.IMAGE) {
+                decodeThumbnail(buffer, bufIndex, len)
+            } else null
+
+            emit(
+                RecoverableFile(
+                    id = 0, // id 在调用方赋值
+                    type = sig.type,
+                    mimeType = sig.mimeType,
+                    extension = sig.extension,
+                    offset = absoluteOffset,
+                    estimatedSize = estimatedSize,
+                    headerBytes = headerBytes,
+                    source = device,
+                    confidence = confidence,
+                    thumbnail = thumbnail
+                )
+            )
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+        bytes < 1024L * 1024 * 1024 -> "${"%.1f".format(bytes / (1024.0 * 1024))} MB"
+        else -> "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))} GB"
+    }
 
     /**
      * 获取分区大小

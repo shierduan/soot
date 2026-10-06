@@ -130,6 +130,8 @@ fun RecoveryScreen(viewModel: MainViewModel) {
     }
 
     var showSettings by remember { mutableStateOf(false) }
+    var showLogs by remember { mutableStateOf(false) }
+    val logs by viewModel.logs.collectAsState()
     var previewFile by remember { mutableStateOf<RecoverableFile?>(null) }
     var previewRecord by remember { mutableStateOf<RecoverableRecord?>(null) }
     var showExport by remember { mutableStateOf(false) }
@@ -192,6 +194,14 @@ fun RecoveryScreen(viewModel: MainViewModel) {
                 Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("扫描设置")
+            }
+            OutlinedButton(
+                onClick = { showLogs = !showLogs },
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.List, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("日志${if (logs.isNotEmpty()) "(${logs.size})" else ""}")
             }
             OutlinedButton(
                 onClick = { showExport = true },
@@ -274,6 +284,50 @@ fun RecoveryScreen(viewModel: MainViewModel) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("文件: ${scanState.filesFound}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                 Text("记录: ${scanState.recordsFound}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+            }
+        }
+
+        // 实时日志面板（可展开）
+        if (showLogs) {
+            Spacer(Modifier.height(10.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E))
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("实时日志", color = Color.White, fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                        Text("${logs.size} 条", color = Color(0xFF9E9E9E), fontSize = 11.sp)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 240.dp)
+                    ) {
+                        items(logs) { entry ->
+                            val color = when (entry.level) {
+                                LogLevel.INFO -> Color(0xFF90CAF9)
+                                LogLevel.WARN -> Color(0xFFFFE082)
+                                LogLevel.ERROR -> Color(0xFFEF9A9A)
+                                LogLevel.SUCCESS -> Color(0xFFA5D6A7)
+                            }
+                            val time = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                                .format(java.util.Date(entry.timestamp))
+                            Row(verticalAlignment = Alignment.Top) {
+                                Text(time, color = Color(0xFF757575), fontSize = 10.sp,
+                                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                                Spacer(Modifier.width(6.dp))
+                                Text(entry.message, color = color, fontSize = 12.sp,
+                                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -627,7 +681,10 @@ fun ScanSettingsDialog(
     onSortChanged: (SortMode) -> Unit
 ) {
     var mode by remember { mutableStateOf(settings.mode) }
-    var quickLimit by remember { mutableIntStateOf(settings.quickScanLimitGb) }
+    var rangeStart by remember { mutableStateOf(settings.rangeStartPercent) }
+    var rangeEnd by remember { mutableStateOf(settings.rangeEndPercent) }
+    var sampleMb by remember { mutableStateOf((settings.sampleBytes / (1024 * 1024)).toInt()) }
+    var gapMb by remember { mutableStateOf((settings.gapBytes / (1024 * 1024)).toInt()) }
     var minSizeKb by remember { mutableIntStateOf(settings.minFileSizeKb) }
     var maxSizeMb by remember { mutableIntStateOf(settings.maxFileSizeMb) }
     var onlyHigh by remember { mutableStateOf(settings.onlyHighConfidence) }
@@ -644,41 +701,60 @@ fun ScanSettingsDialog(
                     FilterChip(
                         selected = mode == ScanMode.QUICK,
                         onClick = { mode = ScanMode.QUICK },
-                        label = { Text("快速") }
+                        label = { Text("快速(稀疏)") }
                     )
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(6.dp))
                     FilterChip(
-                        selected = mode == ScanMode.FULL,
-                        onClick = { mode = ScanMode.FULL },
-                        label = { Text("完整") }
+                        selected = mode == ScanMode.DEEP,
+                        onClick = { mode = ScanMode.DEEP },
+                        label = { Text("深度(完整)") }
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = mode == ScanMode.RANGE,
+                        onClick = { mode = ScanMode.RANGE },
+                        label = { Text("范围(百分比)") }
                     )
                 }
+                Text(
+                    when (mode) {
+                        ScanMode.QUICK -> "快速：每读取一段采样数据后跳过一段，快速覆盖全分区"
+                        ScanMode.DEEP -> "深度：顺序完整扫描整个分区，最全面"
+                        ScanMode.RANGE -> "范围：仅扫描指定百分比区间"
+                    },
+                    fontSize = 11.sp, color = Color.Gray
+                )
+
+                // RANGE 模式参数
+                if (mode == ScanMode.RANGE) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("起始: ${rangeStart.toInt()}%", fontSize = 13.sp)
+                    Slider(value = rangeStart, onValueChange = { rangeStart = it }, valueRange = 0f..99f)
+                    Text("结束: ${rangeEnd.toInt()}%", fontSize = 13.sp)
+                    Slider(value = rangeEnd, onValueChange = { rangeEnd = it }, valueRange = 1f..100f)
+                }
+
+                // QUICK 模式参数
                 if (mode == ScanMode.QUICK) {
-                    Text("扫描上限: $quickLimit GB", fontSize = 13.sp)
-                    Slider(
-                        value = quickLimit.toFloat(),
-                        onValueChange = { quickLimit = it.toInt() },
-                        valueRange = 1f..20f,
-                        steps = 18
-                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text("采样大小: $sampleMb MB", fontSize = 13.sp)
+                    Slider(value = sampleMb.toFloat(), onValueChange = { sampleMb = it.toInt() },
+                        valueRange = 1f..32f, steps = 30)
+                    Text("跳过大小: $gapMb MB", fontSize = 13.sp)
+                    Slider(value = gapMb.toFloat(), onValueChange = { gapMb = it.toInt() },
+                        valueRange = 4f..64f, steps = 29)
+                    Text("覆盖率: ${"%.0f".format(sampleMb.toDouble() / (sampleMb + gapMb) * 100)}%",
+                        fontSize = 11.sp, color = Color.Gray)
                 }
 
                 Spacer(Modifier.height(12.dp))
                 Text("文件大小范围", fontWeight = FontWeight.Bold)
                 Text("最小: $minSizeKb KB", fontSize = 13.sp)
-                Slider(
-                    value = minSizeKb.toFloat(),
-                    onValueChange = { minSizeKb = it.toInt() },
-                    valueRange = 1f..1024f,
-                    steps = 10
-                )
+                Slider(value = minSizeKb.toFloat(), onValueChange = { minSizeKb = it.toInt() },
+                    valueRange = 1f..1024f, steps = 10)
                 Text("最大: $maxSizeMb MB", fontSize = 13.sp)
-                Slider(
-                    value = maxSizeMb.toFloat(),
-                    onValueChange = { maxSizeMb = it.toInt() },
-                    valueRange = 1f..4096f,
-                    steps = 20
-                )
+                Slider(value = maxSizeMb.toFloat(), onValueChange = { maxSizeMb = it.toInt() },
+                    valueRange = 1f..4096f, steps = 20)
 
                 Spacer(Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -732,7 +808,10 @@ fun ScanSettingsDialog(
                 onSettingsChanged(
                     settings.copy(
                         mode = mode,
-                        quickScanLimitGb = quickLimit,
+                        rangeStartPercent = rangeStart.coerceAtMost(rangeEnd),
+                        rangeEndPercent = rangeEnd.coerceAtLeast(rangeStart),
+                        sampleBytes = sampleMb.toLong() * 1024 * 1024,
+                        gapBytes = gapMb.toLong() * 1024 * 1024,
                         minFileSizeKb = minSizeKb,
                         maxFileSizeMb = maxSizeMb,
                         onlyHighConfidence = onlyHigh,
