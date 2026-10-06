@@ -100,13 +100,32 @@ object RootShell {
 
     /**
      * 从指定偏移读取原始字节（通过 dd）
+     *
+     * 优化：使用 bs=4096 大块读取，比 bs=1 快数千倍。
+     * 对于非对齐偏移，先按块读取再截断。
      */
     suspend fun readBytes(device: String, offset: Long, size: Int): ByteArray = withContext(Dispatchers.IO) {
         try {
+            val bs = 4096L
+            val skipBlocks = offset / bs
+            val skipRemainder = (offset % bs).toInt()
+            val totalBytes = skipRemainder + size
+            val countBlocks = (totalBytes + bs - 1) / bs
+
             val process = Runtime.getRuntime().exec(
-                arrayOf("su", "-c", "dd if=$device bs=1 skip=$offset count=$size 2>/dev/null")
+                arrayOf(
+                    "su", "-c",
+                    "dd if=$device bs=$bs skip=$skipBlocks count=$countBlocks 2>/dev/null"
+                )
             )
-            process.inputStream.readBytes()
+            val raw = process.inputStream.readBytes()
+            process.waitFor()
+            // 跳过前缀余数，返回所需长度
+            if (raw.size > skipRemainder) {
+                raw.copyOfRange(skipRemainder, minOf(skipRemainder + size, raw.size))
+            } else {
+                ByteArray(0)
+            }
         } catch (e: Exception) {
             ByteArray(0)
         }

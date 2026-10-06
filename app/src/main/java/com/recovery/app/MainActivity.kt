@@ -1,31 +1,35 @@
 package com.recovery.app
 
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.os.Environment
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.recovery.app.model.RecoverableFile
-import com.recovery.app.model.RecoverableRecord
-import com.recovery.app.model.RecoveryType
+import com.recovery.app.model.*
 import com.recovery.app.secure.CredentialVerifier
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -48,7 +52,6 @@ class MainActivity : ComponentActivity() {
                         val verifier = CredentialVerifier(this)
                         val launched = verifier.verify(credentialLauncher)
                         if (!launched) {
-                            // 设备无锁屏，直接通过
                             callback(true)
                             pendingCallback = null
                         }
@@ -110,9 +113,12 @@ fun RecoveryApp(onVerifyCredential: ((Boolean) -> Unit) -> Unit = {}) {
 @Composable
 fun RecoveryScreen(viewModel: MainViewModel) {
     val rootState by viewModel.rootAvailable.collectAsState()
-    val isScanning by viewModel.isScanning.collectAsState()
-    val scanProgress by viewModel.scanProgress.collectAsState()
-    val result by viewModel.recoveryResult.collectAsState()
+    val scanState by viewModel.scanState.collectAsState()
+    val showTypes by viewModel.showTypes.collectAsState()
+    val minConfidence by viewModel.minConfidence.collectAsState()
+    val sortMode by viewModel.sortMode.collectAsState()
+    val selectedIds by viewModel.selectedFileIds.collectAsState()
+    val scanSettings by viewModel.scanSettings.collectAsState()
 
     val selectedTypes = remember {
         mutableStateMapOf(
@@ -123,25 +129,33 @@ fun RecoveryScreen(viewModel: MainViewModel) {
         )
     }
 
+    var showSettings by remember { mutableStateOf(false) }
     var previewFile by remember { mutableStateOf<RecoverableFile?>(null) }
     var previewRecord by remember { mutableStateOf<RecoverableRecord?>(null) }
-    val scope = rememberCoroutineScope()
+    var showExport by remember { mutableStateOf(false) }
 
-    // 预览对话框
-    previewFile?.let { file ->
-        FilePreviewDialog(file = file, onDismiss = { previewFile = null }) {
-            scope.launch {
-                val info = viewModel.getFilePreview(file)
-                // 这里可以展示更详细的预览
-            }
-        }
-    }
-    previewRecord?.let { record ->
-        RecordPreviewDialog(record = record, onDismiss = { previewRecord = null })
+    previewFile?.let { FilePreviewDialog(file = it, onDismiss = { previewFile = null }) }
+    previewRecord?.let { RecordPreviewDialog(record = it, onDismiss = { previewRecord = null }) }
+
+    if (showExport) {
+        val json = viewModel.exportRecords()
+        AlertDialog(
+            onDismissRequest = { showExport = false },
+            title = { Text("导出记录 (JSON)") },
+            text = {
+                OutlinedTextField(
+                    value = json,
+                    onValueChange = {},
+                    modifier = Modifier.fillMaxWidth().height(240.dp),
+                    readOnly = true
+                )
+            },
+            confirmButton = { TextButton(onClick = { showExport = false }) { Text("关闭") } }
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        // Root 状态提示
+        // Root 状态
         rootState?.let { hasRoot ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -160,8 +174,7 @@ fun RecoveryScreen(viewModel: MainViewModel) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        if (hasRoot) "已获取 Root 权限，可以恢复全部数据"
-                        else "未检测到 Root 权限，部分功能不可用",
+                        if (hasRoot) "已获取 Root 权限" else "未检测到 Root 权限",
                         fontSize = 14.sp
                     )
                 }
@@ -170,52 +183,71 @@ fun RecoveryScreen(viewModel: MainViewModel) {
 
         Spacer(Modifier.height(12.dp))
 
-        // 类型选择
-        Text("选择要恢复的数据类型", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        Spacer(Modifier.height(8.dp))
-
-        val typeLabels = mapOf(
-            RecoveryType.IMAGE to "图片",
-            RecoveryType.VIDEO to "视频",
-            RecoveryType.AUDIO to "音频",
-            RecoveryType.CALL_LOG to "通话记录",
-            RecoveryType.SMS to "短信",
-            RecoveryType.CONTACT to "联系人",
-            RecoveryType.WHATSAPP to "WhatsApp"
-        )
-
-        typeLabels.forEach { (type, label) ->
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
+        // 扫描设置按钮行
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { showSettings = true },
+                modifier = Modifier.weight(1f)
             ) {
-                Checkbox(
-                    checked = selectedTypes[type] == true,
-                    onCheckedChange = { selectedTypes[type] = it }
-                )
-                Text(label, fontSize = 15.sp)
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("扫描设置")
+            }
+            OutlinedButton(
+                onClick = { showExport = true },
+                modifier = Modifier.weight(1f),
+                enabled = scanState.records.isNotEmpty()
+            ) {
+                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("导出记录")
             }
         }
 
-        Spacer(Modifier.height(12.dp))
+        if (showSettings) {
+            ScanSettingsDialog(
+                settings = scanSettings,
+                minConfidence = minConfidence,
+                sortMode = sortMode,
+                onDismiss = { showSettings = false },
+                onSettingsChanged = { viewModel.updateSettings(it) },
+                onConfidenceChanged = { viewModel.setMinConfidence(it) },
+                onSortChanged = { viewModel.setSortMode(it) }
+            )
+        }
+
+        // 类型选择
+        Text("选择要恢复的数据类型", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+        Spacer(Modifier.height(6.dp))
+        val typeLabels = mapOf(
+            RecoveryType.IMAGE to "图片", RecoveryType.VIDEO to "视频",
+            RecoveryType.AUDIO to "音频", RecoveryType.CALL_LOG to "通话记录",
+            RecoveryType.SMS to "短信", RecoveryType.CONTACT to "联系人",
+            RecoveryType.WHATSAPP to "WhatsApp"
+        )
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            typeLabels.forEach { (type, label) ->
+                FilterChip(
+                    selected = selectedTypes[type] == true,
+                    onClick = { selectedTypes[type] = !(selectedTypes[type] ?: false) },
+                    label = { Text(label, fontSize = 12.sp) }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
 
         // 开始扫描按钮
         Button(
             onClick = {
                 val types = selectedTypes.filter { it.value }.keys.toSet()
-                if (types.isNotEmpty()) {
-                    viewModel.startRecovery(types)
-                }
+                if (types.isNotEmpty()) viewModel.startRecovery(types)
             },
             modifier = Modifier.fillMaxWidth(),
-            enabled = !isScanning && rootState == true
+            enabled = !scanState.isScanning && rootState == true
         ) {
-            if (isScanning) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(20.dp),
-                    color = Color.White,
-                    strokeWidth = 2.dp
-                )
+            if (scanState.isScanning) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
                 Text("扫描中...")
             } else {
@@ -225,92 +257,281 @@ fun RecoveryScreen(viewModel: MainViewModel) {
             }
         }
 
-        if (scanProgress.isNotEmpty()) {
-            Spacer(Modifier.height(8.dp))
-            Text(scanProgress, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        // 进度条 + 进度文本
+        if (scanState.isScanning || scanState.isCompleted) {
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(
+                progress = { scanState.progress },
+                modifier = Modifier.fillMaxWidth().height(8.dp),
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "${(scanState.progress * 100).toInt()}% · ${scanState.currentPhaseText}",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            // 实时统计
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("文件: ${scanState.filesFound}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                Text("记录: ${scanState.recordsFound}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+            }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(12.dp))
 
-        // 扫描结果
-        result?.let { r ->
-            if (r.files.isNotEmpty() || r.records.isNotEmpty()) {
-                Text("扫描结果", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(Modifier.height(8.dp))
-
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(r.files) { file ->
-                        FileItemView(file) { previewFile = file }
-                    }
-                    items(r.records) { record ->
-                        RecordItemView(record) { previewRecord = record }
-                    }
+        // 批量操作栏
+        if (selectedIds.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("已选 ${selectedIds.size} 项", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = {
+                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath + "/Recovery"
+                    viewModel.recoverSelected(dir) {}
+                }) {
+                    Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("批量恢复")
                 }
-            } else if (!isScanning) {
+                TextButton(onClick = { viewModel.selectAllFiles(false) }) {
+                    Text("取消")
+                }
+            }
+        }
+
+        // 结果列表
+        val files = viewModel.getFilteredFiles()
+        val records = scanState.records
+
+        if (files.isEmpty() && records.isEmpty()) {
+            if (scanState.isCompleted) {
                 Text("未发现可恢复的数据", color = Color.Gray)
             }
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                // 统计头部
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("扫描结果 (${files.size} 文件 / ${records.size} 记录)",
+                            fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                }
+                // 文件列表
+                items(files, key = { it.id }) { file ->
+                    FileItemView(
+                        file = file,
+                        selected = file.id in selectedIds,
+                        onToggleSelect = { viewModel.toggleFileSelected(file.id) },
+                        onClick = { previewFile = file }
+                    )
+                }
+                // 记录列表
+                items(records, key = { it.id }) { record ->
+                    RecordItemView(record) { previewRecord = record }
+                }
+                item { Spacer(Modifier.height(80.dp)) }
+            }
+        }
+    }
+}
+
+// ==================== 文件项视图（含缩略图 + 置信度 + 选择） ====================
+
+@Composable
+fun FileItemView(
+    file: RecoverableFile,
+    selected: Boolean,
+    onToggleSelect: () -> Unit,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .clickable { onClick() },
+        colors = CardDefaults.cardColors(
+            containerColor = if (selected) Color(0xFFE3F2FD) else MaterialTheme.colorScheme.surfaceVariant
+        )
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // 缩略图 / 类型图标
+            if (file.type == RecoveryType.IMAGE && file.thumbnail != null) {
+                val bmp = remember(file.thumbnail) {
+                    BitmapFactory.decodeByteArray(file.thumbnail, 0, file.thumbnail.size)
+                }
+                if (bmp != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bmp.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(6.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    TypeIcon(file.type)
+                }
+            } else {
+                TypeIcon(file.type)
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            // 信息
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "recovered_${file.id}.${file.extension}",
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    ConfidenceBadge(file.confidence)
+                    Spacer(Modifier.width(6.dp))
+                    Text("${formatFileSize(file.estimatedSize)}", fontSize = 11.sp, color = Color.Gray)
+                }
+            }
+
+            // 选择框
+            Checkbox(
+                checked = selected,
+                onCheckedChange = { onToggleSelect() }
+            )
         }
     }
 }
 
 @Composable
-fun FileItemView(file: RecoverableFile, onClick: () -> Unit = {}) {
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+fun TypeIcon(type: RecoveryType) {
+    Box(
+        modifier = Modifier
+            .size(56.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)),
+        contentAlignment = Alignment.Center
     ) {
-        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                when (file.type) {
-                    RecoveryType.IMAGE -> Icons.Default.Image
-                    RecoveryType.VIDEO -> Icons.Default.VideoLibrary
-                    RecoveryType.AUDIO -> Icons.Default.AudioFile
-                    else -> Icons.Default.Description
-                },
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text("recovered_${file.id}.${file.extension}", fontWeight = FontWeight.Medium)
-                Text(
-                    "${formatFileSize(file.estimatedSize)} · ${file.mimeType}",
-                    fontSize = 12.sp,
-                    color = Color.Gray
-                )
-            }
-            TextButton(onClick = onClick) {
-                Text("预览")
-            }
-        }
+        Icon(
+            when (type) {
+                RecoveryType.IMAGE -> Icons.Default.Image
+                RecoveryType.VIDEO -> Icons.Default.VideoLibrary
+                RecoveryType.AUDIO -> Icons.Default.AudioFile
+                else -> Icons.Default.Description
+            },
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(28.dp)
+        )
     }
 }
+
+@Composable
+fun ConfidenceBadge(confidence: Confidence) {
+    val (color, text) = when (confidence) {
+        Confidence.HIGH -> Color(0xFF2E7D32) to "高"
+        Confidence.MEDIUM -> Color(0xFFE65100) to "中"
+        Confidence.LOW -> Color(0xFF757575) to "低"
+    }
+    Text(
+        text,
+        fontSize = 10.sp,
+        color = Color.White,
+        modifier = Modifier
+            .background(color, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 1.dp)
+    )
+}
+
+// ==================== 记录项视图（按类型渲染） ====================
 
 @Composable
 fun RecordItemView(record: RecoverableRecord, onClick: () -> Unit = {}) {
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .clickable { onClick() },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
-        Row(
-            modifier = Modifier.padding(12.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    record.type.name,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.primary
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            // 类型头像
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    when (record.type) {
+                        RecoveryType.CALL_LOG -> Icons.Default.Call
+                        RecoveryType.SMS -> Icons.Default.Sms
+                        RecoveryType.CONTACT -> Icons.Default.Person
+                        RecoveryType.WHATSAPP -> Icons.Default.Chat
+                        else -> Icons.Default.Description
+                    },
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
                 )
-                Spacer(Modifier.height(4.dp))
-                record.fields.entries.take(3).forEach { (k, v) ->
-                    if (v.isNotEmpty()) {
-                        Text("$k: $v", fontSize = 13.sp, maxLines = 1)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                when (record.type) {
+                    RecoveryType.SMS -> {
+                        Text(
+                            record.fields["号码"] ?: "未知号码",
+                            fontWeight = FontWeight.Medium, fontSize = 14.sp
+                        )
+                        Text(
+                            record.fields["内容"] ?: "",
+                            fontSize = 12.sp, color = Color.Gray,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                        record.fields["日期"]?.let {
+                            Text(it, fontSize = 10.sp, color = Color(0xFF9E9E9E))
+                        }
+                    }
+                    RecoveryType.CALL_LOG -> {
+                        Text(
+                            record.fields["号码"] ?: "未知号码",
+                            fontWeight = FontWeight.Medium, fontSize = 14.sp
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(record.fields["类型"] ?: "", fontSize = 12.sp, color = Color.Gray)
+                            Spacer(Modifier.width(8.dp))
+                            Text("${record.fields["时长(秒)"] ?: ""}s", fontSize = 12.sp, color = Color.Gray)
+                        }
+                        record.fields["日期"]?.let {
+                            Text(it, fontSize = 10.sp, color = Color(0xFF9E9E9E))
+                        }
+                    }
+                    RecoveryType.CONTACT -> {
+                        Text(
+                            record.fields["显示名"] ?: "未知联系人",
+                            fontWeight = FontWeight.Medium, fontSize = 14.sp
+                        )
+                        Text(
+                            record.fields["数据"] ?: "",
+                            fontSize = 12.sp, color = Color.Gray,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    else -> {
+                        Text(record.type.name, fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.primary, fontSize = 14.sp)
+                        record.fields.entries.take(2).forEach { (k, v) ->
+                            if (v.isNotEmpty()) Text("$k: $v", fontSize = 12.sp, maxLines = 1)
+                        }
                     }
                 }
-            }
-            TextButton(onClick = onClick) {
-                Text("详情")
             }
         }
     }
@@ -319,24 +540,44 @@ fun RecordItemView(record: RecoverableRecord, onClick: () -> Unit = {}) {
 // ==================== 预览对话框 ====================
 
 @Composable
-fun FilePreviewDialog(file: RecoverableFile, onDismiss: () -> Unit, onLoad: () -> Unit) {
+fun FilePreviewDialog(file: RecoverableFile, onDismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("文件预览") },
         text = {
             Column {
+                if (file.type == RecoveryType.IMAGE && file.thumbnail != null) {
+                    val bmp = remember(file.thumbnail) {
+                        BitmapFactory.decodeByteArray(file.thumbnail, 0, file.thumbnail.size)
+                    }
+                    if (bmp != null) {
+                        androidx.compose.foundation.Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(200.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                            contentScale = ContentScale.Fit
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
                 Text("文件名: recovered_${file.id}.${file.extension}", fontWeight = FontWeight.Medium)
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(4.dp))
                 Text("类型: ${file.mimeType}")
                 Text("大小: ${formatFileSize(file.estimatedSize)}")
                 Text("偏移: 0x${file.offset.toString(16)}")
-                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("置信度: ")
+                    ConfidenceBadge(file.confidence)
+                }
                 if (file.headerBytes.isNotEmpty()) {
-                    Text("文件头 (hex):", fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text("文件头 (hex):", fontWeight = FontWeight.Medium, fontSize = 12.sp)
                     Text(
                         file.headerBytes.take(32).joinToString(" ") { "%02X".format(it) },
-                        fontSize = 11.sp,
+                        fontSize = 10.sp,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     )
                 }
@@ -368,6 +609,141 @@ fun RecordPreviewDialog(record: RecoverableRecord, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("关闭") }
+        }
+    )
+}
+
+// ==================== 扫描设置对话框 ====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ScanSettingsDialog(
+    settings: ScanSettings,
+    minConfidence: Confidence,
+    sortMode: SortMode,
+    onDismiss: () -> Unit,
+    onSettingsChanged: (ScanSettings) -> Unit,
+    onConfidenceChanged: (Confidence) -> Unit,
+    onSortChanged: (SortMode) -> Unit
+) {
+    var mode by remember { mutableStateOf(settings.mode) }
+    var quickLimit by remember { mutableIntStateOf(settings.quickScanLimitGb) }
+    var minSizeKb by remember { mutableIntStateOf(settings.minFileSizeKb) }
+    var maxSizeMb by remember { mutableIntStateOf(settings.maxFileSizeMb) }
+    var onlyHigh by remember { mutableStateOf(settings.onlyHighConfidence) }
+    var dedupe by remember { mutableStateOf(settings.dedupeEnabled) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("扫描设置") },
+        text = {
+            Column {
+                // 扫描模式
+                Text("扫描模式", fontWeight = FontWeight.Bold)
+                Row {
+                    FilterChip(
+                        selected = mode == ScanMode.QUICK,
+                        onClick = { mode = ScanMode.QUICK },
+                        label = { Text("快速") }
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    FilterChip(
+                        selected = mode == ScanMode.FULL,
+                        onClick = { mode = ScanMode.FULL },
+                        label = { Text("完整") }
+                    )
+                }
+                if (mode == ScanMode.QUICK) {
+                    Text("扫描上限: $quickLimit GB", fontSize = 13.sp)
+                    Slider(
+                        value = quickLimit.toFloat(),
+                        onValueChange = { quickLimit = it.toInt() },
+                        valueRange = 1f..20f,
+                        steps = 18
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
+                Text("文件大小范围", fontWeight = FontWeight.Bold)
+                Text("最小: $minSizeKb KB", fontSize = 13.sp)
+                Slider(
+                    value = minSizeKb.toFloat(),
+                    onValueChange = { minSizeKb = it.toInt() },
+                    valueRange = 1f..1024f,
+                    steps = 10
+                )
+                Text("最大: $maxSizeMb MB", fontSize = 13.sp)
+                Slider(
+                    value = maxSizeMb.toFloat(),
+                    onValueChange = { maxSizeMb = it.toInt() },
+                    valueRange = 1f..4096f,
+                    steps = 20
+                )
+
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = onlyHigh, onCheckedChange = { onlyHigh = it })
+                    Text("仅显示中/高置信度", fontSize = 13.sp)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = dedupe, onCheckedChange = { dedupe = it })
+                    Text("启用去重", fontSize = 13.sp)
+                }
+
+                Spacer(Modifier.height(12.dp))
+                Text("显示过滤", fontWeight = FontWeight.Bold)
+                Text("最低置信度:", fontSize = 13.sp)
+                Row {
+                    Confidence.values().forEach { c ->
+                        FilterChip(
+                            selected = minConfidence == c,
+                            onClick = { onConfidenceChanged(c) },
+                            label = { Text(when (c) {
+                                Confidence.HIGH -> "高"
+                                Confidence.MEDIUM -> "中"
+                                Confidence.LOW -> "全部"
+                            }) }
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                Text("排序方式", fontWeight = FontWeight.Bold)
+                Row {
+                    SortMode.values().forEach { s ->
+                        FilterChip(
+                            selected = sortMode == s,
+                            onClick = { onSortChanged(s) },
+                            label = { Text(when (s) {
+                                SortMode.CONFIDENCE -> "置信度"
+                                SortMode.SIZE_DESC -> "大小↓"
+                                SortMode.SIZE_ASC -> "大小↑"
+                                SortMode.TYPE -> "类型"
+                            }) }
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                onSettingsChanged(
+                    settings.copy(
+                        mode = mode,
+                        quickScanLimitGb = quickLimit,
+                        minFileSizeKb = minSizeKb,
+                        maxFileSizeMb = maxSizeMb,
+                        onlyHighConfidence = onlyHigh,
+                        dedupeEnabled = dedupe
+                    )
+                )
+                onDismiss()
+            }) { Text("应用") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
 }
@@ -420,7 +796,6 @@ fun SecureDeleteScreen(
             singleLine = true
         )
 
-        // 预览区域
         if (showPreview && previewInfo != null) {
             Spacer(Modifier.height(12.dp))
             Card(
@@ -443,7 +818,6 @@ fun SecureDeleteScreen(
 
         Spacer(Modifier.height(12.dp))
 
-        // 预览按钮
         OutlinedButton(
             onClick = { showPreview = !showPreview },
             modifier = Modifier.fillMaxWidth(),
@@ -470,11 +844,8 @@ fun SecureDeleteScreen(
         Button(
             onClick = {
                 if (inputPath.isNotEmpty()) {
-                    // 先验证锁屏密码，再执行删除
                     onVerifyCredential { success ->
-                        if (success) {
-                            viewModel.secureDelete(inputPath, passes) {}
-                        }
+                        if (success) viewModel.secureDelete(inputPath, passes) {}
                     }
                 }
             },
@@ -500,11 +871,9 @@ fun SecureDeleteScreen(
     }
 }
 
-private fun formatFileSize(bytes: Long): String {
-    return when {
-        bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "${bytes / 1024} KB"
-        bytes < 1024 * 1024 * 1024 -> "${"%.1f".format(bytes / (1024.0 * 1024))} MB"
-        else -> "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))} GB"
-    }
+private fun formatFileSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+    bytes < 1024L * 1024 * 1024 -> "${"%.1f".format(bytes / (1024.0 * 1024))} MB"
+    else -> "${"%.2f".format(bytes / (1024.0 * 1024 * 1024))} GB"
 }
