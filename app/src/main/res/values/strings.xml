@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">数据还原大师</string>
+    <string name="tab_recovery">数据还原</string>
+    <string name="tab_secure_delete">安全删除</string>
+    <string name="tab_settings">设置</string>
+</resources>

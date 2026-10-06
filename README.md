@@ -1,134 +1,100 @@
-# Android Root 数据还原工具
+# 数据还原大师 (DataRecovery)
 
-基于 Root 权限的 Android 设备数据提取与还原程序。通过 ADB 连接已 Root 的 Android 设备，读取受保护的系统数据库和媒体文件，将通话记录、短信、联系人、照片、WhatsApp 消息等数据提取并还原为可视化报告。
+一款基于 **Root 权限** 的 Android 原生数据恢复与安全删除工具。
+
+## 核心定位
+
+本工具不是简单的数据导出工具，而是**数据恢复工具**——针对**已被删除、但数据分区中仍残留原始数据**的场景，通过直接扫描存储分区和解析 SQLite 数据库的空闲空间，将已删除的数据还原出来。
 
 ## 功能特性
 
-| 数据类型 | 说明 | 需要 Root |
-|---------|------|:---------:|
-| 通话记录 | 来电/去电/未接记录，含号码、姓名、时长 | ✓ |
-| 短信/彩信 | 收件箱、已发送、草稿等短信与彩信 | ✓ |
-| 联系人 | 姓名、电话、邮箱、组织、备注 | ✓ |
-| 照片/视频 | DCIM、Pictures、Movies 等目录媒体文件 | ✗ |
-| WhatsApp | 消息记录与联系人 | ✓ |
-| 系统信息 | 设备信息、WiFi 网络与密码 | ✓ |
+### 数据恢复
+| 数据类型 | 恢复方式 | 支持预览 |
+|---------|---------|:-------:|
+| 图片 (JPEG/PNG/GIF/WebP/BMP/HEIC) | 文件雕刻 (File Carving) | ✓ |
+| 视频 (MP4/3GP/MKV/AVI/FLV) | 文件雕刻 (File Carving) | ✓ |
+| 音频 (MP3/WAV/AAC/AMR) | 文件雕刻 (File Carving) | ✓ |
+| 通话记录 | SQLite 已删除记录恢复 | ✓ |
+| 短信/彩信 | SQLite 已删除记录恢复 | ✓ |
+| 联系人 | SQLite 已删除记录恢复 | ✓ |
+| 文档/压缩包 | 文件雕刻 (File Carving) | ✓ |
+
+### 安全删除
+- **锁屏密码验证**：删除前必须通过系统锁屏验证（PIN/图案/密码/生物识别）
+- **数据覆写**：可选 1-7 次覆写（1次快速 / 3次DoD标准 / 7次Gutmann标准）
+- **零填充**：覆写为 0x00 后删除，防止数据雕刻恢复
+- **删除前预览**：显示文件信息后确认删除
+
+## 技术原理
+
+### 文件雕刻 (File Carving)
+当文件被删除时，文件系统仅移除索引条目（inode/dentry），实际数据块仍保留在存储介质上。本工具通过 `dd` 直接读取原始块设备（需 Root），扫描文件魔数（magic bytes）识别并重建已删除文件：
+
+- **Header 匹配**：JPEG (`FF D8 FF`)、PNG (`89 50 4E 47...`)、MP4 (`ftyp` box) 等
+- **Footer 定位**：通过文件尾精确确定文件大小（如 JPEG 的 `FF D9`）
+- **容器解析**：MP4 解析 ISO Base Media ftyp box 大小；RIFF 解析 WebP/AVI/WAV
+- **启发式估算**：无 footer 时按类型经验值估算
+
+### SQLite 已删除记录恢复
+SQLite 以固定大小页（默认 4096 字节）存储数据。删除记录时不会清零，而是：
+1. 将页加入空闲页链表（freelist）
+2. 在页内标记 freeblock
+3. 修改 cell 指针数组
+
+本工具直接解析 SQLite 文件格式，从以下区域扫描已删除记录：
+- **空闲页链表**（freelist trunk/leaf pages）
+- **页内未分配空间**（cell content area 到页尾）
+- **页内 freeblock 链表**
+
+通过验证 varint header、serial type 有效性来识别真实的已删除记录。
+
+### 安全删除
+1. `KeyguardManager.createConfirmDeviceCredentialIntent()` 验证锁屏密码
+2. 以 `rws` 模式打开文件，分块覆写为 0
+3. `fsync()` 强制写入物理介质
+4. 截断文件长度为 0
+5. 删除文件
 
 ## 环境要求
 
-- Python 3.8+
-- Android Platform Tools（`adb`）
-- 已 Root 的 Android 设备，并开启 USB 调试
+- Android 6.0+ (API 24+)
+- 设备已获取 Root 权限
+- Android Studio (用于编译) 或 Gradle 8.5+
 
-## 安装
-
-```bash
-# 安装 Python 依赖
-pip install -r requirements.txt
-
-# 确认 adb 可用
-adb version
-```
-
-## 快速开始
+## 编译构建
 
 ```bash
-# 1. 查看所有可提取的数据类型
-python3 main.py --list
+# 克隆项目后
+./gradlew assembleDebug
 
-# 2. 提取通话记录、短信和联系人，生成 HTML 报告
-python3 main.py -t call_logs sms contacts
-
-# 3. 提取全部数据，导出所有格式
-python3 main.py -t all -f all
-
-# 4. 仅提取照片（无需 Root）
-python3 main.py -t photos -o ./photo_backup
-
-# 5. 指定设备序列号（多设备时）
-python3 main.py -t all -s <设备序列号>
-```
-
-## 命令行参数
-
-```
--t, --types TYPE [TYPE ...]   要提取的数据类型，使用 'all' 提取全部
--f, --format FORMAT           导出格式: html / json / csv / all (默认: html)
--o, --output OUTPUT           输出目录 (默认: ./output/<时间戳>)
--s, --serial SERIAL           指定设备序列号
---list                        列出所有可提取的数据类型
---no-root-skip                无 Root 时也继续（仅提取无需 Root 的数据）
-```
-
-## 工作原理
-
-1. **设备连接**：通过 ADB 检测并连接 Android 设备
-2. **Root 检测**：验证 `su` 权限是否可用
-3. **数据拉取**：
-   - 受保护数据库（需 Root）：使用 `su -c cp` 将文件复制到 `/sdcard` 临时目录，再 `adb pull`
-   - 媒体文件：直接 `adb pull` 公开存储目录
-4. **数据解析**：使用 Python `sqlite3` 解析 Android 系统数据库
-5. **报告生成**：导出为 HTML 可视化报告、JSON 或 CSV 文件
-
-## 数据来源路径
-
-```
-通话记录: /data/data/com.android.providers.contacts/databases/calllog.db
-短信彩信: /data/data/com.android.providers.telephony/databases/mmssms.db
-联系人:   /data/data/com.android.providers.contacts/databases/contacts2.db
-WiFi:     /data/misc/wifi/WifiConfigStore.xml
-WhatsApp: /data/data/com.whatsapp/databases/msgstore.db, wa.db
-照片:     /sdcard/DCIM/, /sdcard/Pictures/, /sdcard/Movies/
+# 产物位置
+app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## 项目结构
 
 ```
-.
-├── main.py                 # 主 CLI 入口
-├── config.py               # 全局配置（路径、表名等）
-├── adb_utils.py            # ADB + Root 通信封装
-├── requirements.txt        # Python 依赖
-├── parsers/
-│   └── sqlite_parser.py    # SQLite 数据库解析器
-├── extractors/
-│   ├── base.py             # 提取器基类
-│   ├── call_logs.py        # 通话记录提取
-│   ├── sms.py              # 短信/彩信提取
-│   ├── contacts.py         # 联系人提取
-│   ├── photos.py           # 照片/视频提取
-│   ├── whatsapp.py         # WhatsApp 提取
-│   └── system_info.py      # 系统信息/WiFi 提取
-├── exporters/
-│   ├── html_exporter.py    # HTML 报告生成
-│   ├── json_exporter.py    # JSON 导出
-│   └── csv_exporter.py     # CSV 导出
-└── utils/
-    ├── helpers.py          # 通用工具函数
-    └── logger.py           # 日志工具
-```
-
-## 输出示例
-
-运行后将在输出目录生成：
-
-```
-output/recovery_20240101_120000/
-├── call_logs/
-│   └── raw/calllog.db
-├── sms/
-│   └── raw/mmssms.db
-├── contacts/
-├── photos/
-├── whatsapp/
-└── export/
-    ├── recovery_20240101_120000.html    # 可视化报告
-    ├── recovery_20240101_120000.json    # 结构化数据
-    └── csv/                             # 各数据表 CSV
-        ├── call_logs_records.csv
-        ├── sms_sms.csv
-        └── ...
+app/src/main/java/com/recovery/app/
+├── MainActivity.kt              # 主界面 (Jetpack Compose)
+├── MainViewModel.kt             # 状态管理
+├── model/
+│   └── RecoverableItem.kt       # 数据模型
+├── recovery/
+│   ├── RecoveryEngine.kt        # 恢复引擎（整合调度）
+│   ├── FileCarver.kt            # 文件雕刻引擎
+│   ├── SQLiteRecovery.kt        # SQLite 已删除记录恢复
+│   └── signatures/
+│       ├── FileSignature.kt     # 文件签名定义
+│       └── SignatureRegistry.kt # 签名库（20+ 文件类型）
+├── secure/
+│   ├── SecureDelete.kt          # 安全删除（覆写+删除）
+│   └── CredentialVerifier.kt    # 锁屏密码验证
+├── preview/
+│   └── PreviewManager.kt        # 预览管理
+└── util/
+    └── RootShell.kt             # Root Shell 命令封装
 ```
 
 ## 免责声明
 
-本工具仅供合法的数据备份、取证分析和个人设备的数据恢复使用。使用本工具访问他人设备数据可能违反相关法律法规，请确保你拥有设备的合法访问权限。
+本工具仅供合法的数据恢复、取证分析和个人设备数据找回使用。使用本工具访问他人设备数据可能违反相关法律法规，请确保你拥有设备的合法访问权限。安全删除操作不可逆，请谨慎使用。
