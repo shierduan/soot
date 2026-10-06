@@ -1,5 +1,6 @@
 package com.recovery.app
 
+import android.os.Environment
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.recovery.app.model.Confidence
@@ -123,6 +124,7 @@ class MainViewModel : ViewModel() {
     fun recoverFile(item: RecoverableFile, outputDir: String, onDone: (String?) -> Unit) {
         viewModelScope.launch {
             val path = recoveryEngine.recoverFile(item, outputDir)
+            if (path != null) _lastRecoveryPaths.value = listOf(path)
             onDone(path)
         }
     }
@@ -130,14 +132,23 @@ class MainViewModel : ViewModel() {
     /**
      * 批量恢复选中的文件
      */
-    fun recoverSelected(outputDir: String, onDone: (Int) -> Unit) {
+    fun recoverSelected(outputDir: String, onDone: (List<String>) -> Unit) {
         viewModelScope.launch {
             val selected = scanState.value.files.filter { it.id in _selectedFileIds.value }
             val paths = recoveryEngine.recoverFiles(selected, outputDir)
-            onDone(paths.size)
+            if (paths.isNotEmpty()) _lastRecoveryPaths.value = paths
+            onDone(paths)
             _selectedFileIds.value = emptySet()
         }
     }
+
+    // 默认恢复目录
+    val defaultRecoveryDir: String
+        get() = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath + "/Recovery"
+
+    // 最近一次恢复的文件路径列表（用于提示用户）
+    private val _lastRecoveryPaths = MutableStateFlow<List<String>>(emptyList())
+    val lastRecoveryPaths: StateFlow<List<String>> = _lastRecoveryPaths.asStateFlow()
 
     /**
      * 导出记录为 JSON

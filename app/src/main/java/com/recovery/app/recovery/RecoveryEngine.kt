@@ -182,9 +182,24 @@ class RecoveryEngine {
 
     /**
      * 恢复单个文件到指定输出路径
+     *
+     * - 自动创建输出目录
+     * - 文件名冲突时自动追加序号（recovered_1.jpg, recovered_1_2.jpg...）
+     * - 返回实际保存的完整路径
      */
     suspend fun recoverFile(item: RecoverableFile, outputDir: String): String? {
-        val outputPath = "$outputDir/recovered_${item.id}.${item.extension}"
+        // 确保目录存在
+        val dir = File(outputDir)
+        if (!dir.exists()) dir.mkdirs()
+
+        // 生成不冲突的文件名
+        var outputPath = "$outputDir/recovered_${item.id}.${item.extension}"
+        var counter = 2
+        while (File(outputPath).exists()) {
+            outputPath = "$outputDir/recovered_${item.id}_$counter.${item.extension}"
+            counter++
+        }
+
         return if (fileCarver.saveRecoveredFile(item, outputPath)) outputPath else null
     }
 

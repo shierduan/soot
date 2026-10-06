@@ -7,6 +7,7 @@ import com.recovery.app.model.RecoverableFile
 import com.recovery.app.model.RecoveryType
 import com.recovery.app.model.ScanMode
 import com.recovery.app.model.ScanSettings
+import com.recovery.app.recovery.signatures.ExtensionResolver
 import com.recovery.app.recovery.signatures.FileSignature
 import com.recovery.app.recovery.signatures.SignatureRegistry
 import com.recovery.app.util.RootShell
@@ -246,6 +247,7 @@ class FileCarver {
         var idCounter = startId
         var lastProgressEmit = 0L
         val rateTracker = RateTracker()
+        var actualBytesRead = 0L  // 实际读取的字节数（用于速率计算）
 
         while (true) {
             val expectedOffset = sampleIndex * step
@@ -260,6 +262,8 @@ class FileCarver {
             }
             if (totalRead <= 0) break
 
+            actualBytesRead += totalRead
+
             val actualLen = totalRead
             processBuffer(
                 sampleBuf, actualLen, expectedOffset, device, types, settings,
@@ -273,13 +277,19 @@ class FileCarver {
             val now = System.currentTimeMillis()
             if (now - lastProgressEmit > 300) {
                 val absScanned = scannedEstimate.coerceAtMost(partitionSize)
-                rateTracker.addSample(now, absScanned)
+                // 速率用实际读取字节计算
+                rateTracker.addSample(now, actualBytesRead)
+                val speed = rateTracker.speedBytesPerSec()
+                // ETA 用实际剩余字节计算：剩余虚拟字节 * (sample/step) 即为待读实际字节
+                val remainingVirtual = (partitionSize - absScanned).coerceAtLeast(0)
+                val remainingActual = (remainingVirtual * sampleBytes / step).coerceAtLeast(0)
+                val eta = if (speed > 0) remainingActual * 1000L / speed else 0L
                 emit(
                     ScanEvent.Progress(
                         scannedBytes = absScanned,
                         totalBytes = partitionSize,
-                        speedBytesPerSec = rateTracker.speedBytesPerSec(),
-                        etaMs = rateTracker.etaMs(absScanned, partitionSize)
+                        speedBytesPerSec = speed,
+                        etaMs = eta
                     )
                 )
                 lastProgressEmit = now
@@ -354,6 +364,13 @@ class FileCarver {
                 buffer.copyOfRange(bufIndex, minOf(bufIndex + headerLen, len))
             } else ByteArray(0)
 
+            // 逆向还原精确扩展名（ZIP→docx/xlsx/pptx, RIFF→webp/avi/wav, ftyp→mp4/mov/3gp...）
+            val (resolvedExt, resolvedMime) = if (headerBytes.size >= 8) {
+                ExtensionResolver.resolve(headerBytes, sig)
+            } else {
+                sig.extension to sig.mimeType
+            }
+
             val thumbnail = if (sig.type == RecoveryType.IMAGE) {
                 decodeThumbnail(buffer, bufIndex, len)
             } else null
@@ -362,8 +379,8 @@ class FileCarver {
                 RecoverableFile(
                     id = 0, // id 在调用方赋值
                     type = sig.type,
-                    mimeType = sig.mimeType,
-                    extension = sig.extension,
+                    mimeType = resolvedMime,
+                    extension = resolvedExt,
                     offset = absoluteOffset,
                     estimatedSize = estimatedSize,
                     headerBytes = headerBytes,

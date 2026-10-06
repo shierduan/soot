@@ -3,7 +3,6 @@ package com.recovery.app
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.os.Bundle
-import android.os.Environment
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.ActivityResultLauncher
@@ -151,6 +150,11 @@ fun RecoveryScreen(viewModel: MainViewModel) {
     var previewFile by remember { mutableStateOf<RecoverableFile?>(null) }
     var previewRecord by remember { mutableStateOf<RecoverableRecord?>(null) }
     var showExport by remember { mutableStateOf(false) }
+
+    // 恢复目录（可编辑）+ 恢复结果提示
+    var recoveryDir by remember { mutableStateOf(viewModel.defaultRecoveryDir) }
+    var recoveryMessage by remember { mutableStateOf<String?>(null) }
+    val lastRecoveryPaths by viewModel.lastRecoveryPaths.collectAsState()
 
     previewFile?.let { FilePreviewDialog(file = it, onDismiss = { previewFile = null }) }
     previewRecord?.let { RecordPreviewDialog(record = it, onDismiss = { previewRecord = null }) }
@@ -369,22 +373,49 @@ fun RecoveryScreen(viewModel: MainViewModel) {
 
         // 批量操作栏
         if (selectedIds.isNotEmpty()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("已选 ${selectedIds.size} 项", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = {
-                    val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath + "/Recovery"
-                    viewModel.recoverSelected(dir) {}
-                }) {
-                    Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("批量恢复")
+            Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                // 恢复目录输入
+                OutlinedTextField(
+                    value = recoveryDir,
+                    onValueChange = { recoveryDir = it },
+                    label = { Text("恢复到目录") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("已选 ${selectedIds.size} 项", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = {
+                        recoveryMessage = null
+                        viewModel.recoverSelected(recoveryDir) { paths ->
+                            recoveryMessage = if (paths.isNotEmpty()) {
+                                "已恢复 ${paths.size} 个文件到:\n${paths.joinToString("\n") { "  $it" }}"
+                            } else "恢复失败"
+                        }
+                    }) {
+                        Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("批量恢复")
+                    }
+                    TextButton(onClick = { viewModel.selectAllFiles(false) }) {
+                        Text("取消")
+                    }
                 }
-                TextButton(onClick = { viewModel.selectAllFiles(false) }) {
-                    Text("取消")
+                // 恢复结果提示
+                recoveryMessage?.let { msg ->
+                    Spacer(Modifier.height(4.dp))
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))) {
+                        Text(
+                            msg,
+                            modifier = Modifier.padding(8.dp),
+                            fontSize = 11.sp,
+                            color = Color(0xFF2E7D32)
+                        )
+                    }
                 }
             }
         }
