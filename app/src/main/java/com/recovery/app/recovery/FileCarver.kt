@@ -165,7 +165,7 @@ class FileCarver {
     /**
      * 获取分区大小
      */
-    private fun getPartitionSize(device: String): Long {
+    private suspend fun getPartitionSize(device: String): Long {
         val sizeInfo = RootShell.execute("blockdev --getsize64 $device 2>/dev/null")
         return sizeInfo.trim().toLongOrNull() ?: run {
             val name = device.substringAfterLast("/")
