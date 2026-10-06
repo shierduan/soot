@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import com.recovery.app.model.Confidence
 import com.recovery.app.model.RecoverableFile
 import com.recovery.app.model.RecoveryType
+import com.recovery.app.model.ScanMode
 import com.recovery.app.model.ScanSettings
 import com.recovery.app.recovery.signatures.FileSignature
 import com.recovery.app.recovery.signatures.SignatureRegistry
