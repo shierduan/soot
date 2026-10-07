@@ -151,8 +151,8 @@ fun RecoveryScreen(viewModel: MainViewModel) {
     var previewRecord by remember { mutableStateOf<RecoverableRecord?>(null) }
     var showExport by remember { mutableStateOf(false) }
 
-    // 恢复目录（可编辑）+ 恢复结果提示
-    var recoveryDir by remember { mutableStateOf(viewModel.defaultRecoveryDir) }
+    // 恢复目录（可编辑，持久化保存避免重组丢失）+ 恢复结果提示
+    var recoveryDir by rememberSaveable { mutableStateOf(viewModel.defaultRecoveryDir) }
     var recoveryMessage by remember { mutableStateOf<String?>(null) }
     val lastRecoveryPaths by viewModel.lastRecoveryPaths.collectAsState()
 

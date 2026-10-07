@@ -470,13 +470,38 @@ class FileCarver {
                 offset + 13 <= len
             }
             "bmp" -> {
-                // BMP: BM 后 4 字节是文件大小（小端）
-                if (offset + 6 > len) return false
-                val size = (buffer[offset + 2].toLong() and 0xFF) or
-                        ((buffer[offset + 3].toLong() and 0xFF) shl 8) or
-                        ((buffer[offset + 4].toLong() and 0xFF) shl 16) or
-                        ((buffer[offset + 5].toLong() and 0xFF) shl 24)
-                size in 14..100L * 1024 * 1024
+                // BMP 深度校验：BITMAPFILEHEADER (14B) + BITMAPINFOHEADER 起始
+                // 参考 BMP 规范，逐字段校验以过滤 "BM" 误报
+                if (offset + 30 > len) return false
+                // offset 2-5: 文件大小（小端）
+                val fileSize = readUInt32LE(buffer, offset + 2)
+                if (fileSize !in 14..100L * 1024 * 1024) return false
+                // offset 6-9: 保留字段，必须为 0
+                if (readUInt32LE(buffer, offset + 6) != 0L) return false
+                // offset 10-13: 像素数据偏移量，常见 54(BI_RGB 24bit), 122/138 等
+                val dataOffset = readUInt32LE(buffer, offset + 10)
+                if (dataOffset !in 14..fileSize) return false
+                // offset 14-17: DIB 头大小，有效值 40(BITMAPINFOHEADER), 108/124(V4/V5)
+                val dibSize = readUInt32LE(buffer, offset + 14)
+                if (dibSize !in setOf(40L, 108L, 124L, 12L, 64L, 56L)) return false
+                // offset 18-21: 宽度（有符号），合理范围 1..100000
+                val width = readUInt32LE(buffer, offset + 18).toInt()
+                if (width !in 1..100000) return false
+                // offset 22-25: 高度（有符号，可为负表示自下而上），取绝对值
+                val heightRaw = buffer[offset + 22].toInt() or
+                        (buffer[offset + 23].toInt() shl 8) or
+                        (buffer[offset + 24].toInt() shl 16) or
+                        (buffer[offset + 25].toInt() shl 24)
+                val height = Math.abs(heightRaw)
+                if (height !in 1..100000) return false
+                // offset 26-27: 颜色平面数，必须为 1
+                val planes = (buffer[offset + 26].toInt() and 0xFF) or
+                        ((buffer[offset + 27].toInt() and 0xFF) shl 8)
+                if (planes != 1) return false
+                // offset 28-29: 每像素位数，有效值 1/4/8/16/24/32
+                val bpp = (buffer[offset + 28].toInt() and 0xFF) or
+                        ((buffer[offset + 29].toInt() and 0xFF) shl 8)
+                bpp in setOf(1, 4, 8, 16, 24, 32)
             }
             "mp4", "3gp", "heic", "mov" -> {
                 // ISO Base Media: ftyp box 的 size 必须合理
@@ -568,7 +593,15 @@ class FileCarver {
             }
         }
 
-        // 5. 回退：默认估算值
+        // 5. BMP：文件头 offset 2-5 直接记录文件大小（小端）
+        if (sig.extension == "bmp") {
+            if (fileOffset + 6 <= bufferLen) {
+                val bmpSize = readUInt32LE(buffer, fileOffset + 2)
+                if (bmpSize in 14..sig.maxSize) return bmpSize
+            }
+        }
+
+        // 6. 回退：默认估算值
         return defaultEstimate(sig)
     }
 
